@@ -1,0 +1,16 @@
+import assert from 'node:assert/strict';
+import {previewCadText} from '../cad-import.mjs';
+const draw=e=>`0\nSECTION\n2\nENTITIES\n${e}0\nENDSEC\n0\nEOF\n`;
+const rect='0\nLWPOLYLINE\n90\n4\n70\n1\n10\n0\n20\n0\n10\n100\n20\n0\n10\n100\n20\n60\n10\n0\n20\n60\n';
+const line=(x,y)=>`0\nLINE\n10\n${x}\n20\n${y}\n11\n${x+30}\n21\n${y+20}\n`;
+const mixed=previewCadText(draw(rect+line(200,0)+'0\nREGION\n10\n300\n20\n0\n11\n340\n21\n20\n'));
+assert.equal(mixed.parts.length,1);assert.equal(mixed.unresolved.length,2);
+assert.ok(mixed.unresolved.some(g=>g.type==='REGION'&&g.points.length===2));
+assert.ok(mixed.unresolved.some(g=>g.reason.includes('开放或分叉')));
+const openHole=previewCadText(draw(rect+line(20,20)));
+assert.equal(openHole.parts.length,0,'内部失败轮廓不能被悄悄当作实心零件导入');assert.ok(openHole.unresolved.length);
+const unknown=previewCadText(draw(rect+'0\nREGION\n'));
+assert.equal(unknown.parts.length,0,'未知位置的加工实体不能造成漏孔');
+assert.ok(unknown.unresolved.some(g=>g.points.length===0));
+const malformed=previewCadText('not dxf');assert.equal(malformed.parts.length,0);assert.equal(malformed.unresolved[0].type,'文件');
+console.log('Partial CAD preview tests passed: separate valid parts, gray unsupported/open geometry, topology quarantine and unlocated file failures.');

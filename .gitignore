@@ -1,0 +1,12 @@
+data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+node_modules/
+.npm-cache/
+dist/
+
+# Keep analysis notes; omit historical binaries, extracted tools and run artifacts.
+reverse/**
+!reverse/**/
+!reverse/**/*.md
