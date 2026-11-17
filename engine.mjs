@@ -1,7 +1,5 @@
 import { calculateLogisticsFee } from './logistics.mjs';
 import { fillRectangleSheet } from './beam-nesting.mjs';
-import { fillPolygonSheet, polygonFitsPanel } from './polygon-nesting.mjs';
-import { normalizeShape, shapeArea, shapeBounds, rotationCandidates } from './polygon-geometry.mjs';
 
 const EPSILON = 0.0001;
 const FULL_SHEET_LENGTH = 2440;
@@ -24,8 +22,7 @@ const matchesDimensions = (first, second) =>
   (Math.abs(first.length - second.length) < EPSILON && Math.abs(first.width - second.width) < EPSILON) ||
   (Math.abs(first.length - second.width) < EPSILON && Math.abs(first.width - second.length) < EPSILON);
 
-const isStandardFullSheetPart = (part) => !part.shape && part.rotationAngles === undefined
-  && matchesDimensions(part, { length: FULL_SHEET_LENGTH, width: FULL_SHEET_WIDTH });
+const isStandardFullSheetPart = (part) => matchesDimensions(part, { length: FULL_SHEET_LENGTH, width: FULL_SHEET_WIDTH });
 
 const contains = (outer, inner) =>
   inner.x >= outer.x - EPSILON &&
@@ -201,32 +198,26 @@ function placePart(layout, part, settings) {
 }
 
 const partSorters = {
-  // A thin frame has little solid area but must be placed before a large part
-  // that fits its hole. Use its outer envelope only for ordering, never billing.
-  area: (a, b) => (b.shape?.holes?.length ? b.length*b.width : b.area ?? b.length*b.width)
-    - (a.shape?.holes?.length ? a.length*a.width : a.area ?? a.length*a.width) || Math.max(b.length, b.width) - Math.max(a.length, a.width),
+  area: (a, b) => b.length * b.width - a.length * a.width || Math.max(b.length, b.width) - Math.max(a.length, a.width),
   longSide: (a, b) => Math.max(b.length, b.width) - Math.max(a.length, a.width) || b.length * b.width - a.length * a.width,
   perimeter: (a, b) => b.length + b.width - (a.length + a.width) || b.length * b.width - a.length * a.width,
   width: (a, b) => b.width - a.width || b.length - a.length,
 };
 
-function expandParts(parts, maxVertices = 256) {
+function expandParts(parts) {
   return parts.flatMap((part, sourceIndex) => {
     const quantity = Number(part.quantity);
-    const shape = part.shape ? normalizeShape(part.shape, { maxVertices }) : null;
-    const bounds = shape ? shapeBounds(shape) : null;
-    const length = bounds ? bounds.width : Math.max(0, safeNumber(part.length));
-    const width = bounds ? bounds.height : Math.max(0, safeNumber(part.width));
+    const length = Math.max(0, safeNumber(part.length));
+    const width = Math.max(0, safeNumber(part.width));
     if (!quantity || !length || !width) return [];
     return Array.from({ length: quantity }, (_, instanceIndex) => ({
       ...part,
-      ...(shape ? { shape } : {}),
       sourceIndex,
       instanceIndex,
       instanceId: `${part.id ?? sourceIndex}-${instanceIndex + 1}`,
       length,
       width,
-      area: shape ? shapeArea(shape) : length * width,
+      area: length * width,
       thickness: normalizeThickness(part.thickness),
       material: String(part.material ?? '').trim(),
       allowRotate: part.allowRotate !== false,
@@ -263,7 +254,6 @@ function runAttempt(panels, parts, settings, sortKey) {
   const reportProgress=(current=[])=>settings.onProgress?.({stage:'placing',layouts:[...layouts,...current].map(layout=>({...layout,placements:layout.placements.slice(),freeRects:[]})),totalCount:parts.length,sortKey,strategy:settings.searchStrategy??'maxrects'});
 
   while (pending.length) {
-    if(settings.searchDeadline && Date.now()>=settings.searchDeadline){unplaced.push(...pending.splice(0).map(part=>({...part,reason:'本轮细化搜索时间已达到上限'})));break;}
     const firstPart = pending[0];
     const inventoryMatches = availablePanels
       .map((panel, index) => ({ panel, index }))
@@ -280,16 +270,14 @@ function runAttempt(panels, parts, settings, sortKey) {
       continue;
     }
 
-    const matchingPanelIndexes = inventoryMatches.filter(({ panel }) => settings.searchStrategy === 'polygon'
-      ? polygonFitsPanel(firstPart, panel, settings)
-      : orientationCandidates(firstPart, settings.allowRotation).some((size) =>
+    const matchingPanelIndexes = inventoryMatches.filter(({ panel }) => orientationCandidates(firstPart, settings.allowRotation).some((size) =>
         size.w <= panel.length - settings.panelMarginX * 2 + EPSILON &&
         size.h <= panel.width - settings.panelMarginY * 2 + EPSILON
       ));
 
     if (!matchingPanelIndexes.length) {
       const reason = inventoryMatches.length
-        ? (settings.searchStrategy === 'polygon' ? '在当前旋转角度下无法放入板材' : '零件尺寸超出板材尺寸')
+        ? '零件尺寸超出板材尺寸'
         : '没有匹配材质或厚度的板材';
       unplaced.push({ ...pending.shift(), reason });
       continue;
@@ -301,9 +289,8 @@ function runAttempt(panels, parts, settings, sortKey) {
       const onPlacement=placements=>reportProgress([{...trial,placements}]);
       let placedArea = 0;
       let placedCount = 0;
-      if (settings.searchStrategy === 'beam' || settings.searchStrategy === 'polygon') {
-        const filler = settings.searchStrategy === 'polygon' ? fillPolygonSheet : fillRectangleSheet;
-        const filled = filler(choice.panel, pending.filter((part) => matchesInventory(part, choice.panel)), {...settings,onPlacement});
+      if (settings.searchStrategy === 'beam') {
+        const filled = fillRectangleSheet(choice.panel, pending.filter((part) => matchesInventory(part, choice.panel)), {...settings,onPlacement});
         Object.assign(trial, filled);
         onPlacement(trial.placements);
         placedArea = trial.usedArea;
@@ -342,12 +329,8 @@ function runAttempt(panels, parts, settings, sortKey) {
 
   for (const layout of layouts) {
     const panelArea = layout.width * layout.height;
-    // Keep original length × width accounting, even for concave or holed parts.
-    // Actual polygon area belongs only to the placement search above.
     layout.packingArea = layout.usedArea;
     layout.measurementArea = layout.placements.reduce((sum, part) => sum + part.length * part.width, 0);
-    // Interlocking polygon bounding boxes may overlap; never account more
-    // material or weight than one physical sheet.
     layout.usedArea = Math.min(panelArea, layout.measurementArea);
     layout.usage = panelArea ? layout.usedArea / panelArea : 0;
     layout.billingUsage = layout.isFullSheet ? 1 : Math.min(1, layout.usage + settings.lossRate / 100);
@@ -377,7 +360,7 @@ function runAttempt(panels, parts, settings, sortKey) {
   return {
     layouts,
     unplaced,
-    strategy: settings.searchStrategy === 'polygon' ? 'polygon-nfp' : settings.searchStrategy === 'beam' ? 'rectangle-beam' : 'maxrects',
+    strategy: settings.searchStrategy === 'beam' ? 'rectangle-beam' : 'maxrects',
     sortKey,
     orientationStrategy: settings.orientationStrategy ?? 'bestFit',
     score: [unplaced.length, usedPanelArea - packingArea, layouts.length],
@@ -428,10 +411,8 @@ export function optimizeCuttingPlan(project, { includeBeam = true, onProgress } 
     logisticsProvider: String(project.settings?.logisticsProvider ?? 'none'),
     shippingDestination: String(project.shippingDestination ?? '').trim(),
     allowRotation: project.settings?.allowRotation !== false,
-    rotationStep: safeNumber(project.settings?.rotationStep, 15),
-    maxShapeVertices: Number(project.settings?.maxShapeVertices ?? 256),
   };
-  const parts = expandParts(project.parts ?? [], settings.maxShapeVertices);
+  const parts = expandParts(project.parts ?? []);
   const panels = expandPanels(project.panels ?? []);
 
   if (!parts.length) throw new Error('请至少录入一个尺寸完整的零件。');
@@ -444,33 +425,11 @@ export function optimizeCuttingPlan(project, { includeBeam = true, onProgress } 
     ? ['bestFit', 'preserve', 'rotate']
     : ['bestFit'];
 
-  const polygonMode = parts.some((part) => part.shape || part.rotationAngles !== undefined);
-  const attempts = polygonMode ? [] : sortKeys.flatMap((sortKey) => orientationStrategies.map((orientationStrategy) =>
+  const attempts = sortKeys.flatMap((sortKey) => orientationStrategies.map((orientationStrategy) =>
     runAttempt(panels, parts, { ...settings, orientationStrategy }, sortKey)
   ));
   const quick = project.settings?.optimizationLevel === 'quick';
-  if (polygonMode) {
-    const denseAutomatic = settings.allowRotation && parts.some(part=>part.shape && part.allowRotate && part.rotationAngles===undefined
-      && part.shape.outer.length+(part.shape.holes??[]).reduce((sum,ring)=>sum+ring.length,0)>128);
-    let sufficientBaseline=false;
-    if(denseAutomatic) {
-      const baseline=runAttempt(panels,parts,{...settings,searchStrategy:'polygon',polygonPlacementStrategy:'bottomLeft',polygonAngleStrategy:'orthogonal'},'area');
-      attempts.push(baseline);
-      // With one stock specification and one filled sheet per material/thickness
-      // group, angle refinement cannot reduce the sheet count or billing area.
-      sufficientBaseline=baseline.unplaced.length===0 && parts.every(part=>panels.filter(panel=>matchesInventory(part,panel)).length===1
-        && baseline.layouts.filter(layout=>matchesInventory(part,layout.panel)).length===1);
-    }
-    const searchDeadline=denseAutomatic?Date.now()+(quick?2500:8000):undefined;
-    for (const sortKey of quick ? ['area'] : ['area', 'longSide']) {
-      if(sufficientBaseline)break;
-      for (const polygonPlacementStrategy of quick ? ['bottomLeft'] : ['bottomLeft', 'compact']) {
-        if(searchDeadline && Date.now()>=searchDeadline) break;
-        attempts.push(runAttempt(panels, parts, { ...settings, searchDeadline, searchStrategy: 'polygon', polygonPlacementStrategy }, sortKey));
-      }
-    }
-  }
-  for (const sortKey of !polygonMode && includeBeam ? (quick ? ['area'] : ['area', 'longSide']) : []) {
+  for (const sortKey of includeBeam ? (quick ? ['area'] : ['area', 'longSide']) : []) {
     attempts.push(runAttempt(panels, parts, {
       ...settings,
       searchStrategy: 'beam',
@@ -482,8 +441,8 @@ export function optimizeCuttingPlan(project, { includeBeam = true, onProgress } 
   }
   const best = attempts.reduce((winner, attempt) => compareScores(attempt.score, winner.score) < 0 ? attempt : winner);
   best.algorithm = {
-    label: polygonMode ? '异形排版：真实轮廓 + 多角度搜索' : includeBeam ? '组合优化：矩形束搜索 + 多策略贴合' : '多策略贴合',
-    provenance: polygonMode ? 'independent-polygon-adaptation' : 'independent-rectangle-adaptation',
+    label: includeBeam ? '组合优化：矩形束搜索 + 多策略贴合' : '多策略贴合',
+    provenance: 'independent-rectangle-adaptation',
     attempts: attempts.length,
     selectedStrategy: best.strategy,
     selectedSort: best.sortKey,
@@ -507,7 +466,7 @@ export function optimizeCuttingPlan(project, { includeBeam = true, onProgress } 
     width: part.placedLength,
     height: part.placedWidth,
     rotated: part.rotated,
-    angle: part.angle ?? (part.rotated ? 90 : 0),
+    angle: part.rotated ? 90 : 0,
     strategy: layout.isFullSheet ? 'full-sheet' : best.strategy,
   })));
   return best;
@@ -562,8 +521,6 @@ export function repriceCuttingPlan(plan, project) {
 
 export function validateProject(project) {
   const errors = [];
-  const maxVertices = Number(project.settings?.maxShapeVertices ?? 256);
-  if (!Number.isSafeInteger(maxVertices) || maxVertices < 3) errors.push('轮廓顶点上限必须是至少为 3 的整数');
   (project.panels ?? []).forEach((panel, index) => {
     if (safeNumber(panel.length) <= 0 || safeNumber(panel.width) <= 0) errors.push(`第 ${index + 1} 种板材缺少有效尺寸`);
     if (safeNumber(panel.thickness) <= 0) errors.push(`第 ${index + 1} 种板材缺少有效厚度`);
@@ -573,20 +530,14 @@ export function validateProject(project) {
   if (safeNumber(project.settings?.cuttingFee) < 0) errors.push('全局切割费不能为负数');
   if (safeNumber(project.settings?.packagingFee) < 0) errors.push('全局打包费不能为负数');
   if (project.settings?.profitRate !== undefined && safeNumber(project.settings.profitRate) < 0) errors.push('全局利润比例不能为负数');
-  if (project.settings?.rotationStep !== undefined && (!Number.isFinite(Number(project.settings.rotationStep))
-    || Number(project.settings.rotationStep) < 1 || Number(project.settings.rotationStep) > 180)) errors.push('异形旋转步长必须在 1° 到 180° 之间');
   if (safeNumber(project.lossRate) < 0 || safeNumber(project.lossRate) > 100) errors.push('本单损耗率必须在 0% 到 100% 之间');
   (project.parts ?? []).forEach((part, index) => {
     if (!['number', 'string'].includes(typeof part.quantity) || !String(part.quantity).trim()
       || !Number.isSafeInteger(Number(part.quantity)) || Number(part.quantity) < 0) {
       errors.push(`第 ${index + 1} 种零件的数量必须为有效的非负整数`);
     }
-    if (part.shape) {
-      try { normalizeShape(part.shape, { maxVertices }); } catch (error) { errors.push(`第 ${index + 1} 种零件轮廓无效：${error.message}`); }
-    } else if (safeNumber(part.length) <= 0 || safeNumber(part.width) <= 0) errors.push(`第 ${index + 1} 种零件缺少有效尺寸`);
-    if (part.rotationAngles !== undefined) {
-      try { rotationCandidates(part, project.settings ?? {}); } catch (error) { errors.push(`第 ${index + 1} 种零件旋转角度无效：${error.message}`); }
-    }
+    if (part.shape || part.rotationAngles !== undefined) errors.push(`第 ${index + 1} 种零件含不再支持的轮廓或指定角度，请删除后重新录入矩形零件`);
+    if (safeNumber(part.length) <= 0 || safeNumber(part.width) <= 0) errors.push(`第 ${index + 1} 种零件缺少有效尺寸`);
     if (safeNumber(part.thickness) <= 0) errors.push(`第 ${index + 1} 种零件缺少有效厚度`);
   });
   return errors;
@@ -625,7 +576,6 @@ function layoutDisplayKey(layout) {
     placedWidth: part.placedWidth,
     rotated: part.rotated,
     angle: part.angle ?? (part.rotated ? 90 : 0),
-    placedShape: part.placedShape ?? null,
   })).sort((a, b) => a.y - b.y || a.x - b.x || a.code.localeCompare(b.code));
   return JSON.stringify({
     panel: {

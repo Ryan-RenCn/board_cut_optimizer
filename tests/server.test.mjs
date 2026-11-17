@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { resolveDatabasePath } from '../server.mjs';
+import { createBoardCutServer, resolveDatabasePath } from '../server.mjs';
 
 const temporaryDirectory = mkdtempSync(join(tmpdir(), 'board-cut-optimizer-server-test-'));
 const dataDirectory = join(temporaryDirectory, 'data');
@@ -27,5 +27,13 @@ try {
 } finally {
   rmSync(temporaryDirectory, { recursive: true, force: true });
 }
+
+const server = createBoardCutServer({ databasePath: ':memory:', port: 0 });
+try {
+  const { url } = await server.start();
+  const removed = await fetch(`${url}/api/cad/convert-dwg`, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' } });
+  assert.equal(removed.status, 404, '已移除的CAD转换接口不能再接受请求');
+  assert.equal((await fetch(`${url}/api/draft`)).status, 200, '草稿存储接口应继续可用');
+} finally { await server.close(); }
 
 console.log('server tests passed');

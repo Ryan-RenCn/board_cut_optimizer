@@ -1,5 +1,3 @@
-import { normalizeShape, shapeBounds } from './polygon-geometry.mjs';
-
 const number = (value) => Number.isFinite(Number(value)) ? Number(value) : 0;
 const formatNumber = (value, decimals = 1) => new Intl.NumberFormat('zh-CN', { useGrouping: false, maximumFractionDigits: decimals }).format(number(value));
 const formatCurrency = (value) => new Intl.NumberFormat('zh-CN', { style: 'currency', currency: 'CNY' }).format(number(value));
@@ -50,13 +48,9 @@ export const DEFAULT_QUOTATION_TEMPLATE = `明细
 未税合计：{{未税合计}}
 税后合计：{{税后合计}}`;
 
-function partDetailLine(part, maxShapeVertices) {
+function partDetailLine(part) {
   const description = String(part?.description ?? '').replace(/\s+/g, ' ').trim();
-  if (part?.shape) {
-    const shape = normalizeShape(part.shape, { maxVertices: maxShapeVertices });
-    const bounds = shapeBounds(shape);
-    return `${formatNumber(bounds.width)}*${formatNumber(bounds.height)}*${formatNumber(part.thickness)}mm ${formatNumber(part.quantity, 0)}张${description ? ` [${description}]` : ''}`;
-  }
+  if (part?.shape || part?.rotationAngles !== undefined) throw new Error('仅支持矩形零件报价，请删除旧版轮廓或指定角度零件后重试');
   const dimensions = [part?.length, part?.width, part?.thickness].map((value) => formatNumber(value));
   return `${dimensions.join('*')}mm ${formatNumber(part?.quantity, 0)}张${description ? ` [${description}]` : ''}`;
 }
@@ -67,7 +61,6 @@ export function formatQuotationText({
   projectDescription = '',
   shippingDestination = '',
   parts = [],
-  maxShapeVertices = 256,
   panelTotal = 0,
   taxRate = 0,
   taxedPanelTotal = panelTotal,
@@ -86,7 +79,7 @@ export function formatQuotationText({
     '工程说明': String(projectDescription ?? ''),
     '发货目的地': String(shippingDestination ?? ''),
     '分隔线': separator,
-    '零件明细': parts.map((part) => partDetailLine(part, maxShapeVertices)).join('\n'),
+    '零件明细': parts.map(partDetailLine).join('\n'),
     '板材报价': formatCurrency(panelTotal),
     '材料税率': `${formatNumber(taxRate, 2)}%`,
     '材料税后价格': formatCurrency(taxedPanelTotal),

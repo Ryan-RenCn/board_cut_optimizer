@@ -141,4 +141,24 @@ for (const parts of [
   } finally { h.close(); }
 }
 
-console.log('App workflow regressions passed: save ordering, current-loss repricing, incomplete quotations and integer quantity entry.');
+{
+  const legacyPart = { ...base.parts[0], shape: { outer: [[0, 0], [500, 0], [0, 500]], holes: [] }, rotationAngles: [17.3], cadSource: { fileName: 'old.dxf' } };
+  const h = harness({ ...base, parts: [legacyPart], settings: { ...base.settings, rotationStep: 15, maxShapeVertices: 256 } });
+  try {
+    h.run('renderParts();queueDraftSave();');
+    assert.match(h.node('#unsupportedPartsNotice').textContent, /1 行旧版轮廓.*不再支持/);
+    assert.match(h.node('#partsBody').innerHTML, /不支持/);
+    assert.doesNotMatch(h.node('#partsBody').innerHTML, /data-edit-shape|<path/);
+    assert.deepEqual(h.read('project.parts[0]'), legacyPart, '加载时不得丢弃旧轮廓');
+    assert.equal(h.read('project.settings.rotationStep ?? null'), null);
+    assert.equal(h.read('project.settings.maxShapeVertices ?? null'), null);
+    h.run('exportPartsCsv()');
+    assert.match(h.messages.at(-1), /不支持的旧版轮廓/);
+    await h.flushSaves();
+    assert.deepEqual(h.store.getDraft().parts[0], legacyPart, '自动保存后仍须保留旧轮廓数据');
+    h.run('project.parts=[];renderParts();');
+    assert.equal(h.node('#unsupportedPartsNotice').textContent, '');
+  } finally { h.close(); }
+}
+
+console.log('App workflow regressions passed: save ordering, current-loss repricing, incomplete quotations, integer quantity entry and preserved unsupported legacy parts.');

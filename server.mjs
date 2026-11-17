@@ -3,7 +3,6 @@ import { createServer } from 'node:http';
 import { extname, join, normalize, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createProjectStore } from './storage.mjs';
-import { convertDwg, defaultDwgConverter } from './dwg-convert.mjs';
 
 const root = fileURLToPath(new URL('.', import.meta.url));
 const types = { '.html': 'text/html; charset=utf-8', '.css': 'text/css; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.mjs': 'text/javascript; charset=utf-8', '.json': 'application/json; charset=utf-8', '.svg': 'image/svg+xml' };
@@ -38,22 +37,12 @@ export function createBoardCutServer({
   databasePath = resolveDatabasePath(staticRoot),
   host = '127.0.0.1',
   port = 2547,
-  dwgConverterPath = defaultDwgConverter,
 } = {}) {
   const store = createProjectStore(databasePath);
   let listening = false;
   let closed = false;
 
   async function handleApi(request, response, pathname) {
-    if (pathname === '/api/cad/convert-dwg' && request.method === 'POST') {
-      if (request.headers.origin && request.headers.origin !== `http://${request.headers.host}`) { sendJson(response, 403, { error: '不允许跨站转换请求' }); return true; }
-      if (request.headers['content-type'] !== 'application/octet-stream') { sendJson(response, 415, { error: '请以DWG二进制上传' }); return true; }
-      const chunks = []; let size = 0;
-      for await (const chunk of request) { size += chunk.length; if (size > 10 * 1024 * 1024) throw new Error('DWG文件超过10 MB'); chunks.push(chunk); }
-      try { sendJson(response, 200, await convertDwg(Buffer.concat(chunks), { converterPath: dwgConverterPath })); }
-      catch (error) { sendJson(response, 400, { error: error.message }); }
-      return true;
-    }
     if (pathname === '/api/global-settings' && request.method === 'GET') {
       sendJson(response, 200, { globalSettings: store.getGlobalSettings() });
       return true;

@@ -3,12 +3,7 @@ import { calculateLogisticsFee, LOGISTICS_DESTINATIONS, LOGISTICS_PROVIDER, LOGI
 import { partsFromCsv, serializePartsCsv } from './parts-csv.mjs';
 import { DEFAULT_QUOTATION_TEMPLATE, LEGACY_DEFAULT_QUOTATION_TEMPLATE, PREVIOUS_TAX_DEFAULT_QUOTATION_TEMPLATE, formatQuotationText } from './quotation.mjs';
 import { calculateMaterialAfterTax, normalizeTaxRate } from './tax-pricing.mjs';
-import { shapeBounds } from './polygon-geometry.mjs';
-import { parseRotationAngles, shapeFromEditor, partsFromShapeJson, serializeShapeJson } from './parts-shapes.mjs';
-import earcut from './vendor/earcut.mjs';
-import { previewCadText } from './cad-import.mjs';
 import { startOptimization } from './optimization-client.mjs';
-import { createCadPreview } from './cad-preview.mjs';
 
 const STORAGE_KEY = 'smartcut-web:draft:v1'; // 旧版迁移键，不能改名。
 const LIBRARY_KEY = 'smartcut-web:projects:v1'; // 旧版迁移键，不能改名。
@@ -59,8 +54,6 @@ const defaults = {
     packagingFee: 0,
     logisticsProvider: 'none',
     allowRotation: true,
-    rotationStep: 15,
-    maxShapeVertices: 256,
     optimizationLevel: 'full',
     partEntryKey: 'tab',
     quotationTemplate: DEFAULT_QUOTATION_TEMPLATE,
@@ -98,13 +91,6 @@ let storageErrorShown = false;
 let draftSaveChain = Promise.resolve();
 let quoteAdjustments = [];
 let quoteSignature = null;
-let shapeEditingPart = null;
-let cadPendingParts = [];
-let cadAutoTimer=null,cadReparsePending=false;
-let cadPreviewRevision = 0;
-let cadParsing = false;
-let cadPreviewController = null;
-
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 const number = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
@@ -132,10 +118,8 @@ function mergedProject(value, activeGlobal = null) {
   settings.profitRate = Number.isFinite(profitRate) && profitRate >= 0 ? profitRate : 100;
   settings.logisticsProvider = settings.logisticsProvider === LOGISTICS_PROVIDER ? LOGISTICS_PROVIDER : 'none';
   settings.partEntryKey = settings.partEntryKey === 'enter' ? 'enter' : 'tab';
-  const rotationStep = Number(settings.rotationStep);
-  settings.rotationStep = Number.isFinite(rotationStep) && rotationStep >= 1 && rotationStep <= 180 ? rotationStep : 15;
-  const maxShapeVertices = Number(settings.maxShapeVertices);
-  settings.maxShapeVertices = Number.isSafeInteger(maxShapeVertices) && maxShapeVertices >= 3 ? maxShapeVertices : 256;
+  delete settings.rotationStep;
+  delete settings.maxShapeVertices;
   settings.quotationTemplate = typeof settings.quotationTemplate === 'string'
     ? [LEGACY_DEFAULT_QUOTATION_TEMPLATE, PREVIOUS_TAX_DEFAULT_QUOTATION_TEMPLATE].includes(settings.quotationTemplate)
       ? DEFAULT_QUOTATION_TEMPLATE
@@ -336,7 +320,7 @@ function renderProjectHeader() {
 }
 
 function inputCell({ type = 'text', value = '', field, index, min, step, placeholder = '', partCell = false, readOnly = false }) {
-  return `<input type="${type}" value="${escapeHtml(value)}" data-field="${field}" data-index="${index}" ${partCell ? 'data-part-cell' : ''} ${min !== undefined ? `min="${min}"` : ''} ${step !== undefined ? `step="${step}"` : ''} ${readOnly ? 'readonly class="shape-dimension" title="异形包围尺寸，请在轮廓中修改顶点"' : ''} placeholder="${escapeHtml(placeholder)}" />`;
+  return `<input type="${type}" value="${escapeHtml(value)}" data-field="${field}" data-index="${index}" ${partCell ? 'data-part-cell' : ''} ${min !== undefined ? `min="${min}"` : ''} ${step !== undefined ? `step="${step}"` : ''} ${readOnly ? 'readonly title="不再支持此零件，请删除后重新录入矩形零件"' : ''} placeholder="${escapeHtml(placeholder)}" />`;
 }
 
 function renderPanels() {
@@ -397,15 +381,14 @@ function thicknessSelectCell(part, index) {
   return `<select data-field="thickness" data-index="${index}" data-part-cell>${unavailable}${options}</select>`;
 }
 
+const hasUnsupportedPartGeometry = part => Boolean(part.shape) || part.rotationAngles !== undefined;
+
 function partThumbnail(part, label = '零件小图') {
+  if (hasUnsupportedPartGeometry(part)) return '<span class="part-thumbnail-empty">不支持</span>';
   const length = number(part.length), width = number(part.width);
   if (length <= 0 || width <= 0) return '<span class="part-thumbnail-empty">待录入</span>';
-  try {
-    const shape = part.shape ?? { outer: [[0, 0], [length, 0], [length, width], [0, width]], holes: [] };
-    const bounds = shapeBounds(shape);
-    const padding = Math.max(bounds.width, bounds.height) * .05;
-    return `<svg viewBox="${bounds.minX - padding} ${bounds.minY - padding} ${bounds.width + padding * 2} ${bounds.height + padding * 2}" preserveAspectRatio="xMidYMid meet" role="img" aria-label="${escapeHtml(label)}"><path d="${shapeSvgPath(shape)}" fill="#bfd1ff" fill-rule="evenodd" stroke="#344fb8" stroke-width="${Math.max(bounds.width, bounds.height) * .015}" /></svg>`;
-  } catch { return '<span class="part-thumbnail-empty">轮廓无效</span>'; }
+  const padding = Math.max(length, width) * .05;
+  return `<svg viewBox="${-padding} ${-padding} ${length + padding * 2} ${width + padding * 2}" preserveAspectRatio="xMidYMid meet" role="img" aria-label="${escapeHtml(label)}"><rect width="${length}" height="${width}" fill="#bfd1ff" stroke="#344fb8" stroke-width="${Math.max(length, width) * .015}" /></svg>`;
 }
 
 function refreshPartThumbnail(index) {
@@ -415,21 +398,24 @@ function refreshPartThumbnail(index) {
 }
 
 function renderParts() {
+  const unsupportedCount = project.parts.filter(hasUnsupportedPartGeometry).length;
+  const notice = $('#unsupportedPartsNotice');
+  notice.classList.toggle('hidden', unsupportedCount === 0);
+  notice.textContent = unsupportedCount ? `当前仅支持矩形零件；有 ${unsupportedCount} 行旧版轮廓或指定角度数据不再支持，请删除后重新录入矩形零件。` : '';
   $('#partsBody').innerHTML = project.parts.map((part, index) => `
     <tr>
       <td><span class="row-handle">••</span></td>
-      <td class="part-thumbnail-cell"><button class="part-thumbnail" type="button" data-part-thumbnail="${index}" data-edit-shape="${index}" aria-label="预览并编辑${escapeHtml(part.code || `P${index + 1}`)}轮廓">${partThumbnail(part, `${part.code || `P${index + 1}`} 零件小图`)}</button></td>
-      <td>${inputCell({ type: 'number', value: part.length, field: 'length', index, min: 0, step: .1, partCell: true, readOnly: Boolean(part.shape) })}</td>
-      <td>${inputCell({ type: 'number', value: part.width, field: 'width', index, min: 0, step: .1, partCell: true, readOnly: Boolean(part.shape) })}</td>
+      <td class="part-thumbnail-cell"><div class="part-thumbnail" data-part-thumbnail="${index}">${partThumbnail(part, `${part.code || `P${index + 1}`} 零件小图`)}</div></td>
+      <td>${inputCell({ type: 'number', value: part.length, field: 'length', index, min: 0, step: .1, partCell: true, readOnly: hasUnsupportedPartGeometry(part) })}</td>
+      <td>${inputCell({ type: 'number', value: part.width, field: 'width', index, min: 0, step: .1, partCell: true, readOnly: hasUnsupportedPartGeometry(part) })}</td>
       <td>${materialSelectCell(part, index)}</td>
       <td>${thicknessSelectCell(part, index)}</td>
       <td>${inputCell({ type: 'number', value: part.quantity, field: 'quantity', index, min: 0, step: 1, partCell: true })}</td>
       <td><label class="table-checkbox"><input type="checkbox" data-field="allowRotate" data-index="${index}" data-part-cell aria-label="允许旋转" ${part.allowRotate !== false ? 'checked' : ''} /></label></td>
       <td>${inputCell({ value: part.description, field: 'description', index, placeholder: '可选', partCell: true })}</td>
       <td>${inputCell({ value: part.code, field: 'code', index, placeholder: `P-${String(index + 1).padStart(2, '0')}`, partCell: true })}</td>
-      <td><button class="button small part-outline-button" type="button" data-edit-shape="${index}" title="编辑外轮廓、内孔及旋转角度">${part.shape ? '异形' : '轮廓'}${part.rotationAngles ? ' · 角度' : ''}</button></td>
       <td><button class="delete-row" data-delete-part="${index}" aria-label="删除零件" tabindex="-1">×</button></td>
-    </tr>`).join('') || `<tr><td colspan="12"><div class="empty-table">还没有零件，点击右上角添加</div></td></tr>`;
+    </tr>`).join('') || `<tr><td colspan="11"><div class="empty-table">还没有零件，点击右上角添加</div></td></tr>`;
 }
 
 function renderShippingDestination() {
@@ -540,220 +526,8 @@ function clearParts() {
   addPart({ focusFirstCell: true });
 }
 
-function shapeSvgPath(shape) {
-  return [shape.outer, ...(shape.holes ?? [])].map((ring) => ring.map((point, index) => {
-    const [x, y] = point;
-    if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error('轮廓坐标无效');
-    return `${index ? 'L' : 'M'}${x},${y}`;
-  }).join(' ') + ' Z').join(' ');
-}
-
 function partAngle(part) {
-  return Number.isFinite(part.angle) ? part.angle : part.rotated ? 90 : 0;
-}
-
-function openShapeEditor(index) {
-  const part = project.parts[index];
-  if (!part) return;
-  shapeEditingPart = part;
-  $('#shapeDialogTitle').textContent = `${part.code || `P${index + 1}`} · 轮廓与旋转`;
-  $('#shapeOuterInput').value = part.shape?.outer.map((point) => point.join(',')).join('\n') ?? '';
-  $('#shapeHolesInput').value = part.shape?.holes?.map((ring) => ring.map((point) => point.join(',')).join('\n')).join('\n\n') ?? '';
-  $('#shapeAnglesInput').value = part.rotationAngles?.join(', ') ?? '';
-  $('#shapeEditorError').textContent = '';
-  previewShapeEditor();
-  $('#shapeDialog').showModal();
-}
-
-function previewShapeEditor() {
-  try {
-    const shape = shapeFromEditor($('#shapeOuterInput').value, $('#shapeHolesInput').value, { maxVertices: project.settings.maxShapeVertices });
-    parseRotationAngles($('#shapeAnglesInput').value);
-    $('#shapeEditorError').textContent = '';
-    if (!shape) {
-      $('#shapeEditorPreview').textContent = '保留矩形外形；可单独保存指定旋转角度。';
-      return;
-    }
-    const bounds = shapeBounds(shape);
-    const padding = Math.max(bounds.width, bounds.height) * .04;
-    $('#shapeEditorPreview').innerHTML = `<svg viewBox="${-padding} ${-padding} ${bounds.width + padding * 2} ${bounds.height + padding * 2}" role="img" aria-label="轮廓预览"><path d="${shapeSvgPath(shape)}" fill="#bfd1ff" fill-rule="evenodd" stroke="#4058a4" stroke-width="${Math.max(bounds.width, bounds.height) * .003}" /></svg><span>包围尺寸 ${formatNumber(bounds.width, 2)} × ${formatNumber(bounds.height, 2)} mm · ${shape.holes.length} 个内孔</span>`;
-  } catch (error) {
-    $('#shapeEditorError').textContent = error.message;
-    $('#shapeEditorPreview').textContent = '请修正轮廓后重新预览。';
-  }
-}
-
-function saveShapeEditor(event) {
-  event.preventDefault();
-  try {
-    if (!project.parts.includes(shapeEditingPart)) throw new Error('该零件已不在当前清单中，请重新打开编辑');
-    const shape = shapeFromEditor($('#shapeOuterInput').value, $('#shapeHolesInput').value, { maxVertices: project.settings.maxShapeVertices });
-    const angles = parseRotationAngles($('#shapeAnglesInput').value);
-    if (shape) {
-      const bounds = shapeBounds(shape);
-      shapeEditingPart.shape = shape;
-      shapeEditingPart.length = bounds.width;
-      shapeEditingPart.width = bounds.height;
-    } else delete shapeEditingPart.shape;
-    if (angles) shapeEditingPart.rotationAngles = angles;
-    else delete shapeEditingPart.rotationAngles;
-    $('#shapeDialog').close();
-    shapeEditingPart = null;
-    renderRows();
-    commitChange();
-    toast('轮廓与旋转角度已保存');
-  } catch (error) {
-    $('#shapeEditorError').textContent = error.message;
-  }
-}
-
-function clearPartShape() {
-  if (!project.parts.includes(shapeEditingPart)) return;
-  delete shapeEditingPart.shape;
-  delete shapeEditingPart.rotationAngles;
-  $('#shapeDialog').close();
-  shapeEditingPart = null;
-  renderRows();
-  commitChange();
-  toast('已恢复为当前包围尺寸的矩形');
-}
-
-function cadThicknessOptions() {
-  const select = $('#cadThickness');
-  const previous = Number(select.value);
-  const thicknesses = inventoryThicknessesFrom(project.panels, $('#cadMaterial').value);
-  select.innerHTML = thicknesses.map((value) => `<option value="${value}">${formatNumber(value, 2)} mm</option>`).join('') || '<option value="">请先添加库存厚度</option>';
-  if (thicknesses.includes(previous)) select.value = String(previous);
-}
-
-function invalidateCadPreview() {
-  clearTimeout(cadAutoTimer);cadReparsePending=false;
-  cadPreviewController?.destroy();
-  cadPreviewController = null;
-  cadPreviewRevision += 1;
-  cadPendingParts = [];
-  $('#commitCadButton').disabled = true;
-  $('#commitCadButton').textContent = '添加到清单';
-  $('#cadImportPreview').innerHTML = '<p>文件或参数已改变，请重新解析并预览。</p>';
-  $('#cadImportError').textContent = '';
-}
-
-function openCadImport() {
-  const groups = inventoryGroupsFrom(project.panels);
-  const material = $('#cadMaterial');
-  material.innerHTML = groups.map((group) => `<option value="${escapeHtml(group.material)}">${escapeHtml(group.label)}</option>`).join('') || '<option value="">请先添加板材库存</option>';
-  $('#cadFileInput').value = '';
-  $('#cadQuantity').value = '1';
-  $('#cadUnit').value = '';
-  $('#cadSolidMode').value = 'ignore';
-  $('#cadCurveTolerance').value = '0.1';
-  $('#cadJoinTolerance').value = '0.01';
-  cadThicknessOptions();
-  invalidateCadPreview();
-  $('#cadImportPreview').innerHTML = '<p>选择文件后点击“解析并预览”。</p>';
-  $('#parseCadButton').disabled = cadParsing;
-  $('#cadDialog').showModal();
-}
-
-function scheduleCadPreview() {
-  clearTimeout(cadAutoTimer);cadReparsePending=true;
-  cadAutoTimer=setTimeout(()=>{cadAutoTimer=null;if(!cadParsing && $('#cadDialog').open && $('#cadFileInput').files.length){cadReparsePending=false;parseCadImport({preventDefault(){}});}},160);
-}
-
-async function parseCadImport(event) {
-  event.preventDefault();
-  if (cadParsing) {cadReparsePending=true;return;}
-  clearTimeout(cadAutoTimer);cadReparsePending=false;
-  cadParsing = true;
-  cadPreviewController?.destroy();
-  cadPreviewController = null;
-  $('#parseCadButton').disabled = true;
-  const token = ++cadPreviewRevision;
-  cadPendingParts = [];
-  $('#commitCadButton').disabled = true;
-  $('#cadImportError').textContent = '';
-  $('#cadImportPreview').textContent = '正在解析轮廓…';
-  try {
-    const files = [...$('#cadFileInput').files];
-    if (!files.length) throw new Error('请选择至少一个 DXF 或 DWG 文件');
-    if (files.length > 50) throw new Error('每次最多导入 50 个 DXF 文件');
-    for (const file of files) {
-      if (!/\.(dxf|dwg)$/i.test(file.name)) throw new Error(`${file.name}：请选择 DXF 或 DWG 文件`);
-      if (file.size > 10 * 1024 * 1024) throw new Error(`${file.name}：文件不能超过 10 MB`);
-    }
-    const quantity = Number($('#cadQuantity').value);
-    const thickness = Number($('#cadThickness').value);
-    const curveTolerance = Number($('#cadCurveTolerance').value);
-    const joinTolerance = Number($('#cadJoinTolerance').value);
-    if (!Number.isInteger(quantity) || quantity < 1 || quantity > 10000) throw new Error('每种轮廓数量须为 1–10000 的整数');
-    if (!Number.isFinite(thickness) || thickness <= 0) throw new Error('请先在板材库存中添加可用材质和厚度');
-    if (!Number.isFinite(curveTolerance) || curveTolerance < .001 || curveTolerance > 10) throw new Error('曲线误差须在 0.001–10 mm 之间');
-    if (!Number.isFinite(joinTolerance) || joinTolerance < .000001 || joinTolerance > 1) throw new Error('端点拼接容差须在 0.000001–1 mm 之间');
-    const options = { panels: clone(project.panels), material: $('#cadMaterial').value, thickness, quantity, makeId, maxVertices: project.settings.maxShapeVertices,
-      curveTolerance, joinTolerance, unitOverride: $('#cadUnit').value || undefined, solidMode: $('#cadSolidMode').value };
-    const nextParts = [],grayParts=[];
-    const warnings = [];
-    for (const file of files) {
-      let text, converted, parsed;
-      try {
-      if (/\.dwg$/i.test(file.name)) {
-        const response = await fetch('/api/cad/convert-dwg', { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: await file.arrayBuffer() });
-        converted = await response.json();
-        if (!response.ok) throw new Error(`${file.name}：${converted.error || 'DWG转换失败'}`);
-        text = converted.dxf;
-      } else text = await file.text();
-      parsed = previewCadText(text, { ...options, fileName: file.name.replace(/\.dwg$/i, '.dxf') });
-      } catch(error){parsed={parts:[],unresolved:[{type:'文件',points:[],layer:'',reason:error.message}],warnings:[error.message]};}
-      for (const part of parsed.parts) part.cadSource = { ...part.cadSource, previewFileId: `file-${files.indexOf(file)}`, fileName: file.name };
-      if (converted) {
-        for (const part of parsed.parts) part.cadSource = { ...part.cadSource, fileName: file.name, format: 'DWG', converter: converted.converter, signature: converted.signature };
-        for (const warning of converted.warnings ?? []) warnings.push(`${file.name}：转换提示 ${warning}`);
-      }
-      for(const [i,gray]of (parsed.unresolved??[]).entries()){
-        const points=gray.points??[],bounds=points.length?shapeBounds({outer:points.length<3?[points[0],points.at(-1),points.at(-1)]:points}):{minX:0,minY:0,width:0,height:0};
-        grayParts.push({previewDisabled:true,previewReason:gray.reason,previewLocated:points.length>0,previewClosed:gray.closed,quantity:0,length:bounds.width,width:bounds.height,code:`${gray.type||'图形'} ${i+1}`,shape:points.length?{outer:points.map(([x,y])=>[x-bounds.minX,y-bounds.minY]),holes:[]}:undefined,cadSource:{fileName:file.name,previewFileId:`file-${files.indexOf(file)}`,origin:[bounds.minX,bounds.minY],layers:[gray.layer||'0']}});
-      }
-      nextParts.push(...parsed.parts);
-      if (nextParts.length+grayParts.length > 10000) throw new Error('本次预览不能超过10000项，请分批选择图纸');
-      for (const warning of parsed.warnings ?? []) warnings.push(`${file.name}：${typeof warning === 'string' ? warning : warning.message ?? String(warning)}`);
-      if (token !== cadPreviewRevision || !$('#cadDialog').open) return;
-    }
-    cadPendingParts = nextParts;
-    const total = nextParts.reduce((sum, part) => sum + number(part.quantity), 0);
-    $('#cadImportPreview').innerHTML = `<p class="cad-import-summary">已解析 ${files.length} 个文件，共 ${nextParts.length} 种可导入轮廓 / ${total} 件，${grayParts.length} 个图形标灰不可导入。灰色仅作参考；无法定位的图元只列出原因。筛选仅改变可见范围；勾选决定添加哪些零件，添加后保留原清单。</p>${warnings.length ? `<div class="cad-import-warnings" role="status"><b>导入提示</b><ul>${warnings.map((warning) => `<li>${escapeHtml(warning)}</li>`).join('')}</ul></div>` : ''}<div id="cadInteractivePreview"></div>`;
-    cadPreviewController = createCadPreview($('#cadInteractivePreview'), [...nextParts,...grayParts], { thumbnail: partThumbnail, formatNumber,
-      onSelectionChange: (selected, { error = '' } = {}) => {
-        $('#commitCadButton').disabled = !selected.length || Boolean(error);
-        $('#commitCadButton').textContent = `添加所选 ${selected.length} 种零件`;
-        $('#cadImportError').textContent = error;
-      } });
-  } catch (error) {
-    if (token === cadPreviewRevision) {
-      cadPendingParts = [];
-      $('#cadImportError').textContent = error.message || 'CAD 解析失败';
-      $('#cadImportPreview').textContent = '未添加任何零件，请修正文件或参数后重试。';
-    }
-  } finally {
-    cadParsing = false;
-    $('#parseCadButton').disabled = false;
-    if(cadReparsePending && $('#cadDialog').open)scheduleCadPreview();
-  }
-}
-
-function commitCadImport() {
-  if (cadParsing || !cadPendingParts.length) return;
-  let added;
-  try { added = cadPreviewController?.getSelectedParts() ?? cadPendingParts; } catch (error) { $('#cadImportError').textContent = error.message; return; }
-  if (!added.length) return;
-  const onlyBlank = project.parts.length === 1 && !project.parts[0].shape && number(project.parts[0].length) === 0
-    && number(project.parts[0].width) === 0 && !project.parts[0].code && !project.parts[0].description;
-  if (onlyBlank) project.parts = [];
-  project.parts.push(...added);
-  cadPendingParts = [];
-  $('#cadDialog').close();
-  renderRows();
-  commitChange();
-  toast(`已添加 ${added.length} 种 CAD 零件`);
+  return part.rotated ? 90 : 0;
 }
 
 function focusPartCell(cell) {
@@ -832,7 +606,7 @@ function handleTableInput(event, collection) {
     }
     return;
   }
-  if (collection === 'parts' && row.shape && (field === 'length' || field === 'width')) return;
+  if (collection === 'parts' && hasUnsupportedPartGeometry(row) && (field === 'length' || field === 'width')) return;
   row[field] = field === 'allowRotate' ? input.checked : numericFields.has(field) ? number(input.value) : input.value;
   if (collection === 'parts' && field === 'material') {
     [row.thickness = ''] = inventoryThicknessesFrom(project.panels, row.material);
@@ -856,13 +630,11 @@ function renderLiveOptimization(update) {
   const layouts=update.layouts??[];
   const count=layouts.reduce((sum,layout)=>sum+layout.placements.length,0);
   $('#optimizationLiveText').textContent=`正在试排：本轮已放入 ${count} / ${update.totalCount} 件 · 当前 ${layouts.length} 张板；预览尚非最终方案`;
-  $('#layoutSubtitle').textContent='计算中实时更新；正在检查孔洞、余量和可用放置位置。';
+  $('#layoutSubtitle').textContent='计算中实时更新；正在检查余量和可用放置位置。';
   $('#layoutsContainer').innerHTML=layouts.map((layout,index)=>{
     const height=Math.max(220,Math.min(560,850*layout.height/layout.width));
-    const shapes=layout.placements.map((part,i)=>part.placedShape
-      ? `<path class="part-rect${i===layout.placements.length-1?' trace-current-part':''}" fill="${palette[(part.sourceIndex??i)%palette.length]}" fill-rule="evenodd" d="${shapeSvgPath(part.placedShape)}"><title>${escapeHtml(part.code||`P${(part.sourceIndex??i)+1}`)}</title></path>`
-      : `<rect class="part-rect" fill="${palette[(part.sourceIndex??i)%palette.length]}" x="${part.x}" y="${part.y}" width="${part.placedLength}" height="${part.placedWidth}" />`).join('');
-    return `<article class="layout-card live-layout-card"><div class="layout-card-header"><h3>第 ${index+1} 张 · ${escapeHtml(layout.panel.material||'默认材质')} · ${formatNumber(layout.panel.thickness,1)} mm</h3><span>试排中 · ${layout.placements.length} 件</span></div><div class="layout-canvas-wrap"><svg class="layout-svg" viewBox="0 0 ${layout.width} ${layout.height}" style="height:${height}px" aria-label="计算中的第${index+1}张排版"><rect class="panel-bg" width="${layout.width}" height="${layout.height}" />${shapes}</svg></div></article>`;
+    const rectangles = layout.placements.map((part, i) => `<rect class="part-rect${i === layout.placements.length - 1 ? ' trace-current-part' : ''}" fill="${palette[(part.sourceIndex ?? i) % palette.length]}" x="${part.x}" y="${part.y}" width="${part.placedLength}" height="${part.placedWidth}" />`).join('');
+    return `<article class="layout-card live-layout-card"><div class="layout-card-header"><h3>第 ${index+1} 张 · ${escapeHtml(layout.panel.material||'默认材质')} · ${formatNumber(layout.panel.thickness,1)} mm</h3><span>试排中 · ${layout.placements.length} 件</span></div><div class="layout-canvas-wrap"><svg class="layout-svg" viewBox="0 0 ${layout.width} ${layout.height}" style="height:${height}px" aria-label="计算中的第${index+1}张排版"><rect class="panel-bg" width="${layout.width}" height="${layout.height}" />${rectangles}</svg></div></article>`;
   }).join('');
 }
 
@@ -981,7 +753,6 @@ function buildQuotationText() {
   }
   const totals = adjustedQuoteTotals();
   return formatQuotationText({
-    maxShapeVertices: project.settings.maxShapeVertices,
     template: project.settings.quotationTemplate,
     projectName: project.name,
     projectDescription: project.description,
@@ -1102,64 +873,6 @@ function renderResult() {
   renderReport();
 }
 
-function labelPointInRing([x, y], ring) {
-  let inside = false;
-  for (let index = 0, previous = ring.length - 1; index < ring.length; previous = index++) {
-    const a = ring[previous];
-    const b = ring[index];
-    if ((a[1] > y) !== (b[1] > y) && x < a[0] + (b[0] - a[0]) * (y - a[1]) / (b[1] - a[1])) inside = !inside;
-  }
-  return inside;
-}
-
-function partLabelPlacement(part, size, code, sizeText, minDimension) {
-  let x = part.x + part.placedLength / 2;
-  let y = part.y + part.placedWidth / 2;
-  if (!part.placedShape) return { x, y, size };
-  const shape = part.placedShape;
-  const rings = [shape.outer, ...(shape.holes ?? [])];
-  if (!labelPointInRing([x, y], shape.outer) || (shape.holes ?? []).some((ring) => labelPointInRing([x, y], ring))) {
-    const points = [];
-    const holeIndices = [];
-    rings.forEach((ring, index) => {
-      if (index) holeIndices.push(points.length / 2);
-      ring.forEach((point) => points.push(...point));
-    });
-    const triangles = earcut(points, holeIndices, 2);
-    let largestArea = 0;
-    for (let index = 0; index < triangles.length; index += 3) {
-      const a = triangles[index] * 2;
-      const b = triangles[index + 1] * 2;
-      const c = triangles[index + 2] * 2;
-      const area = Math.abs((points[b] - points[a]) * (points[c + 1] - points[a + 1]) - (points[b + 1] - points[a + 1]) * (points[c] - points[a]));
-      if (area > largestArea) {
-        largestArea = area;
-        x = (points[a] + points[b] + points[c]) / 3;
-        y = (points[a + 1] + points[b + 1] + points[c + 1]) / 3;
-      }
-    }
-    if (!largestArea) return null;
-  }
-  // Keep both text lines in a disk wholly contained in the actual material.
-  // This also suppresses labels on strips too narrow to display readable text.
-  let radius = Infinity;
-  for (const ring of rings) {
-    for (let index = 0; index < ring.length; index += 1) {
-      const a = ring[index];
-      const b = ring[(index + 1) % ring.length];
-      const dx = b[0] - a[0];
-      const dy = b[1] - a[1];
-      const lengthSquared = dx * dx + dy * dy;
-      const t = lengthSquared ? Math.max(0, Math.min(1, ((x - a[0]) * dx + (y - a[1]) * dy) / lengthSquared)) : 0;
-      radius = Math.min(radius, Math.hypot(x - a[0] - t * dx, y - a[1] - t * dy));
-    }
-  }
-  const textWidth = (text) => Array.from(String(text)).reduce((width, character) => width + (/[^\x00-\x7f]/.test(character) ? 1.1 : 1), 0);
-  const halfWidth = Math.max(textWidth(code), textWidth(sizeText) * .68) / 2;
-  size = Math.min(size, radius * .85 / Math.hypot(halfWidth, 1.05));
-  return size >= Math.max(6, minDimension * .006) ? { x, y, size } : null;
-}
-
 function renderLayoutCard(layout, index, count = 1, previewStep = null) {
   const labels = new Map();
   const materials = new Map();
@@ -1176,12 +889,10 @@ function renderLayoutCard(layout, index, count = 1, previewStep = null) {
     const code = layout.isFullSheet ? '整板件' : part.code || `P${part.sourceIndex + 1}`;
     const sizeText = `${formatNumber(part.length, 1)} × ${formatNumber(part.width, 1)}${partAngle(part) ? ` · ${formatNumber(partAngle(part), 2)}°` : ''}`;
     const label = part.placedLength > minDimension * .09 && part.placedWidth > minDimension * .055
-      ? partLabelPlacement(part, labelSize, code, sizeText, minDimension) : null;
+      ? { x: part.x + part.placedLength / 2, y: part.y + part.placedWidth / 2, size: labelSize } : null;
     const attributes = `class="part-rect${previewStep !== null && placementIndex === previewStep - 1 ? ' trace-current-part' : ''}" fill="${color}"`;
     const title = `${escapeHtml(code)} · ${part.length} × ${part.width} mm${partAngle(part) ? ` · ${formatNumber(partAngle(part), 3)}°` : ''}`;
-    const geometry = part.placedShape
-      ? `<path ${attributes} d="${shapeSvgPath(part.placedShape)}" fill-rule="evenodd"><title>${title}</title></path>`
-      : `<rect ${attributes} x="${part.x}" y="${part.y}" width="${part.placedLength}" height="${part.placedWidth}"><title>${title}</title></rect>`;
+    const geometry = `<rect ${attributes} x="${part.x}" y="${part.y}" width="${part.placedLength}" height="${part.placedWidth}"><title>${title}</title></rect>`;
     return `<g>${geometry}${label ? `<text class="part-label" x="${label.x}" y="${label.y - label.size * .18}" font-size="${label.size}">${escapeHtml(code)}</text><text class="part-size" x="${label.x}" y="${label.y + label.size * .65}" font-size="${label.size * .68}">${escapeHtml(sizeText)}</text>` : ''}</g>`;
   }).join('');
   const unusedPatternId = `unusedPattern-${previewStep === null ? 'final' : 'trace'}-${index}`;
@@ -1291,38 +1002,18 @@ function csvEscape(value) {
 
 function exportPartsCsv() {
   if (!project.parts.length) return toast('请先添加零件再导出 CSV', 'error');
-  if (project.parts.some((part) => part.shape || part.rotationAngles)) return toast('四列 CSV 无法保存轮廓和指定角度，请使用“导出轮廓 JSON”', 'error');
+  if (project.parts.some(hasUnsupportedPartGeometry)) return toast('清单含不支持的旧版轮廓或指定角度，请删除后再导出矩形 CSV', 'error');
   const safeName = (project.name || '板优排工程').replace(/[\\/:*?"<>|]/g, '-');
   download(`${safeName}-零件清单.csv`, serializePartsCsv(project.parts), 'text/csv;charset=utf-8');
   toast('CSV 零件清单已导出');
 }
 
-function exportShapeParts() {
-  if (!project.parts.length) return toast('请先添加零件再导出轮廓 JSON', 'error');
-  try {
-    const safeName = (project.name || '板优排工程').replace(/[\\/:*?"<>|]/g, '-');
-    download(`${safeName}-零件轮廓.json`, serializeShapeJson(project.parts, { maxVertices: project.settings.maxShapeVertices }), 'application/json;charset=utf-8');
-    toast('轮廓、内孔与角度已导出');
-  } catch (error) { toast(`导出失败：${error.message}`, 'error'); }
-}
-
-async function importShapeParts(file) {
-  if (!file.name.toLowerCase().endsWith('.json')) throw new Error('请选择轮廓 JSON 文件');
-  if (file.size > 10 * 1024 * 1024) throw new Error('轮廓文件不能超过 10 MB');
-  const [firstGroup] = inventoryGroupsFrom(project.panels);
-  const parts = partsFromShapeJson(await file.text(), { panels: project.panels, material: firstGroup?.material ?? '', makeId, maxVertices: project.settings.maxShapeVertices });
-  project.parts = parts;
-  renderRows();
-  commitChange();
-  toast(`已导入 ${parts.length} 种零件；材质厚度未匹配的项目请重新选择库存`);
-}
-
 function exportReport() {
   if (!result) return toast('请先生成排版', 'error');
   const totals = adjustedQuoteTotals();
-  const rows = [['排版号', '板材材质', '板材厚度(mm)', '板材长度(mm)', '板材宽度(mm)', '实际用量重量(kg)', '整板件', '实际利用率', '本单损耗率(%)', '计价利用率', '计费比例', '整张成本价(元)', '利润比例(%)', '板材报价未税(元)', '材料税率(%)', '材料税后价格(元)', '调整后切割费(元)', '未税单张报价(元)', '税后单张报价(元)', '打包费合计(元)', '物流公司', '发货目的地', '物流时效(天)', '物流费合计(元)', '未税最终报价(元)', '税后最终报价(元)', '零件编号', '零件说明', '零件材质', '零件厚度(mm)', '零件长度(mm)', '零件宽度(mm)', 'X(mm)', 'Y(mm)', '旋转角度(°)', '轮廓类型', '计量面积(mm²)']];
+  const rows = [['排版号', '板材材质', '板材厚度(mm)', '板材长度(mm)', '板材宽度(mm)', '实际用量重量(kg)', '整板件', '实际利用率', '本单损耗率(%)', '计价利用率', '计费比例', '整张成本价(元)', '利润比例(%)', '板材报价未税(元)', '材料税率(%)', '材料税后价格(元)', '调整后切割费(元)', '未税单张报价(元)', '税后单张报价(元)', '打包费合计(元)', '物流公司', '发货目的地', '物流时效(天)', '物流费合计(元)', '未税最终报价(元)', '税后最终报价(元)', '零件编号', '零件说明', '零件材质', '零件厚度(mm)', '零件长度(mm)', '零件宽度(mm)', 'X(mm)', 'Y(mm)', '旋转角度(°)', '计量面积(mm²)']];
   result.layouts.forEach((layout, layoutIndex) => layout.placements.forEach((part) => rows.push([
-    layoutIndex + 1, layout.panel.material || '默认材质', layout.panel.thickness, layout.width, layout.height, layout.actualWeight, layout.isFullSheet ? '是' : '否', layout.usage, project.lossRate, layout.billingUsage, layout.billingRate, layout.panel.cost, project.settings.profitRate, quoteAdjustments[layoutIndex].panelCharge, project.taxRate, quoteAdjustments[layoutIndex].taxedPanelCharge, quoteAdjustments[layoutIndex].cuttingFee, quoteAdjustments[layoutIndex].panelCharge + quoteAdjustments[layoutIndex].cuttingFee, quoteAdjustments[layoutIndex].taxedPanelCharge + quoteAdjustments[layoutIndex].cuttingFee, totals.packagingTotal, totals.logistics.providerLabel, totals.logistics.destination, totals.logistics.transitDays ?? '', totals.logisticsTotal, totals.finalTotal, totals.taxedFinalTotal, part.code || `P${part.sourceIndex + 1}`, part.description || '', part.material || '默认材质', part.thickness, part.length, part.width, part.x, part.y, partAngle(part), part.shape ? '异形' : '矩形', part.length * part.width,
+    layoutIndex + 1, layout.panel.material || '默认材质', layout.panel.thickness, layout.width, layout.height, layout.actualWeight, layout.isFullSheet ? '是' : '否', layout.usage, project.lossRate, layout.billingUsage, layout.billingRate, layout.panel.cost, project.settings.profitRate, quoteAdjustments[layoutIndex].panelCharge, project.taxRate, quoteAdjustments[layoutIndex].taxedPanelCharge, quoteAdjustments[layoutIndex].cuttingFee, quoteAdjustments[layoutIndex].panelCharge + quoteAdjustments[layoutIndex].cuttingFee, quoteAdjustments[layoutIndex].taxedPanelCharge + quoteAdjustments[layoutIndex].cuttingFee, totals.packagingTotal, totals.logistics.providerLabel, totals.logistics.destination, totals.logistics.transitDays ?? '', totals.logisticsTotal, totals.finalTotal, totals.taxedFinalTotal, part.code || `P${part.sourceIndex + 1}`, part.description || '', part.material || '默认材质', part.thickness, part.length, part.width, part.x, part.y, partAngle(part), part.length * part.width,
   ])));
   download(`${project.name || '板优排'}-开料报告.csv`, `\uFEFF${rows.map((row) => row.map(csvEscape).join(',')).join('\r\n')}`, 'text/csv;charset=utf-8');
   toast('CSV 报告已导出');
@@ -1344,34 +1035,6 @@ async function importPartsFile(file) {
 }
 
 function bindEvents() {
-  $('#importCadButton').addEventListener('click', openCadImport);
-  $('#closeCadButton').addEventListener('click', () => $('#cadDialog').close());
-  $('#cadDialog').addEventListener('close', invalidateCadPreview);
-  $('#cadImportForm').addEventListener('submit', parseCadImport);
-  $('#commitCadButton').addEventListener('click', commitCadImport);
-  $('#cadMaterial').addEventListener('change', () => { cadThicknessOptions(); invalidateCadPreview();scheduleCadPreview(); });
-  for (const id of ['cadFileInput', 'cadThickness', 'cadQuantity', 'cadUnit', 'cadSolidMode', 'cadCurveTolerance', 'cadJoinTolerance']) {
-    $(`#${id}`).addEventListener(['cadFileInput','cadThickness','cadUnit','cadSolidMode'].includes(id) ? 'change' : 'input', ()=>{invalidateCadPreview();scheduleCadPreview();});
-  }
-  $('#shapeForm').addEventListener('submit', saveShapeEditor);
-  $('#closeShapeButton').addEventListener('click', () => $('#shapeDialog').close());
-  $('#shapeDialog').addEventListener('close', () => { shapeEditingPart = null; });
-  $('#shapePreviewButton').addEventListener('click', previewShapeEditor);
-  $('#clearShapeButton').addEventListener('click', clearPartShape);
-  $('#shapeExampleButton').addEventListener('click', () => {
-    $('#shapeOuterInput').value = '0,0\n200,0\n200,80\n80,80\n80,200\n0,200';
-    $('#shapeHolesInput').value = '';
-    $('#shapeAnglesInput').value = '';
-    previewShapeEditor();
-  });
-  $('#importShapesButton').addEventListener('click', () => $('#shapeFileInput').click());
-  $('#exportShapesButton').addEventListener('click', exportShapeParts);
-  $('#shapeFileInput').addEventListener('change', async (event) => {
-    const [file] = event.target.files;
-    if (!file) return;
-    try { await importShapeParts(file); } catch (error) { toast(`导入失败：${error.message}`, 'error'); }
-    event.target.value = '';
-  });
   $$('.nav-item').forEach((button) => button.addEventListener('click', () => showView(button.dataset.view)));
   $('#addPanelButton').addEventListener('click', addMaterial);
   $('#addPartButton').addEventListener('click', addPart);
@@ -1412,8 +1075,6 @@ function bindEvents() {
     commitChange();
   });
   $('#partsBody').addEventListener('click', (event) => {
-    const shapeButton = event.target.closest('[data-edit-shape]');
-    if (shapeButton) { openShapeEditor(Number(shapeButton.dataset.editShape)); return; }
     selectPartCellContent(event);
     const button = event.target.closest('[data-delete-part]'); if (!button) return;
     project.parts.splice(Number(button.dataset.deletePart), 1); renderRows(); commitChange();
@@ -1476,19 +1137,6 @@ function bindEvents() {
   });
   $$('[data-setting]').forEach((input) => input.addEventListener('change', () => {
     const field = input.dataset.setting;
-    if (field === 'maxShapeVertices' && (!Number.isSafeInteger(Number(input.value)) || Number(input.value) < 3)) {
-      input.value = project.settings.maxShapeVertices;
-      toast('轮廓顶点上限须为至少 3 的整数', 'error');
-      return;
-    }
-    if (field === 'rotationStep') {
-      const next = Number(input.value);
-      if (!Number.isFinite(next) || next < 1 || next > 180) {
-        input.value = project.settings.rotationStep;
-        toast('旋转步长须在 1–180 度之间', 'error');
-        return;
-      }
-    }
     project.settings[field] = input.type === 'checkbox'
       ? input.checked
       : input.type === 'radio' || input.tagName === 'SELECT' || field === 'quotationTemplate'

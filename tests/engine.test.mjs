@@ -383,4 +383,24 @@ function assertLayoutGeometry(result, { sawWidth, panelMarginX, panelMarginY }) 
   assert.equal(plan.stats.placedCount, 2);
 }
 
+{
+  const project = {
+    settings: { ...settings, rotationStep: 'obsolete', maxShapeVertices: 1 },
+    panels: [{ length: 500, width: 500, thickness: 18 }],
+    parts: [{ id: 'legacy', length: 100, width: 100, thickness: 18, quantity: 1 }],
+  };
+  assert.equal(optimizeCuttingPlan(project).stats.placedCount, 1, '已移除的旧设置不能影响矩形排版');
+  for (const geometry of [
+    { shape: { outer: [[0, 0], [100, 0], [0, 100]], holes: [] } },
+    { rotationAngles: [17.3] },
+    { rotationAngles: [0, 90] },
+    { rotationAngles: null },
+  ]) {
+    const legacy = { ...project, parts: [{ ...project.parts[0], ...geometry }] };
+    const before = structuredClone(legacy);
+    assert.throws(() => optimizeCuttingPlan(legacy), /不再支持.*重新录入矩形零件/, '旧轮廓不得静默变成矩形排版');
+    assert.deepEqual(legacy, before, '拒绝旧数据时必须保留原始工程');
+  }
+}
+
 console.log('engine tests passed');

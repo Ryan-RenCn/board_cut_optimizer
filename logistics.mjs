@@ -1,4 +1,4 @@
-// 费率来源：项目根目录《上海库沓物流价格表.xlsx》。
+// 上海库沓物流费率（上海始发），目的地分组及价格在下方维护。
 export const LOGISTICS_PROVIDER = 'shanghai-kuta';
 export const LOGISTICS_PROVIDER_LABEL = '上海库沓物流（上海始发）';
 export const LOGISTICS_PRICE_RATE = 1.2;

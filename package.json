@@ -1,6 +1,6 @@
 {
   "name": "board_cut_optimizer",
-  "version": "1.0.21",
+  "version": "1.0.22",
   "description": "板优排——Windows 本地板材开料优化与报价应用",
   "private": true,
   "type": "module",
@@ -34,13 +34,6 @@
       "optimization-worker.mjs",
       "optimization-client.mjs",
       "beam-nesting.mjs",
-      "polygon-geometry.mjs",
-      "polygon-nesting.mjs",
-      "parts-shapes.mjs",
-      "cad-import.mjs",
-      "cad-preview.mjs",
-      "dwg-convert.mjs",
-      "vendor/**",
       "parts-csv.mjs",
       "tax-pricing.mjs",
       "logistics.mjs",
@@ -51,20 +44,6 @@
       "electron-zoom.mjs",
       "assets/app-icon.png",
       "package.json"
-    ],
-    "extraResources": [
-      {
-        "from": "tools/libredwg",
-        "to": "tools/libredwg"
-      },
-      {
-        "from": "报价模板.txt",
-        "to": "报价模板.txt"
-      },
-      {
-        "from": "上海库沓物流价格表.xlsx",
-        "to": "上海库沓物流价格表.xlsx"
-      }
     ],
     "win": {
       "icon": "assets/app-icon.ico",

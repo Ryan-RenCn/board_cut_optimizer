@@ -26,7 +26,6 @@ async function createMainWindow() {
     staticRoot: projectRoot,
     databasePath,
     port: 0,
-    ...(app.isPackaged ? { dwgConverterPath: join(process.resourcesPath, 'tools', 'libredwg', 'dwg2dxf.exe') } : {}),
   });
   const { url } = await localServer.start();
 

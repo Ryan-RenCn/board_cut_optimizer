@@ -51,4 +51,8 @@ assert.equal(customText, [
   '{{未知字段}}',
 ].join('\n'), '自定义模板应替换已知占位符并保留未知占位符');
 
+for (const geometry of [{ shape: { outer: [[0, 0], [100, 0], [0, 100]] } }, { rotationAngles: [17.3] }]) {
+  assert.throws(() => formatQuotationText({ parts: [{ length: 100, width: 100, thickness: 18, quantity: 1, ...geometry }] }), /仅支持矩形零件报价/);
+}
+
 console.log('quotation tests passed');

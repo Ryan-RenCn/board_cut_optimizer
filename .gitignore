@@ -1,12 +1,21 @@
-data/
-*.sqlite
-*.sqlite-shm
-*.sqlite-wal
-node_modules/
-.npm-cache/
-dist/
+# Track application source, project configuration and tests only.
+/*
+!/.gitignore
+!/LICENSE
+!/package.json
+!/package-lock.json
+!/*.mjs
+!/*.html
+!/*.css
 
-# Keep analysis notes; omit historical binaries, extracted tools and run artifacts.
-reverse/**
-!reverse/**/
-!reverse/**/*.md
+# Icons are required by the application and Windows build.
+!/assets/
+/assets/*
+!/assets/app-icon.png
+!/assets/app-icon.ico
+
+# Keep test code; generated files and reference documents stay local.
+!/tests/
+/tests/**
+!/tests/**/
+!/tests/**/*.mjs
