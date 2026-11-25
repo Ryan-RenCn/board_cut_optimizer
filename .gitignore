@@ -1,21 +1,16 @@
-# Track application source, project configuration and tests only.
+# Keep only native application source, build inputs and documentation.
 /*
 !/.gitignore
 !/LICENSE
-!/package.json
-!/package-lock.json
-!/*.mjs
-!/*.html
-!/*.css
+!/README.md
+!/rust-app/
+!/tools/
+/tools/*
+!/tools/build-rust-win.ps1
 
-# Icons are required by the application and Windows build.
-!/assets/
-/assets/*
-!/assets/app-icon.png
-!/assets/app-icon.ico
+# Generated native binaries and debug symbols.
+/rust-app/target/
+/rust-app/**/*.pdb
 
-# Keep test code; generated files and reference documents stay local.
-!/tests/
-/tests/**
-!/tests/**/
-!/tests/**/*.mjs
+# User databases, release artifacts, caches and local reference documents
+# remain local (data/, dist/, .test-output/, etc. are excluded above).
