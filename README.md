@@ -1,10 +1,10 @@
 # 板优排 · Rust 原生桌面版
 
-用于矩形板材开料优化与报价的 Windows x64 原生应用，使用 Rust + egui + SQLite。不需要 Node.js、Electron、WebView2 或本地 HTTP 服务。仓库仅保留 Rust 版本，旧网页/Electron 实现及其依赖、构建产物已移除。
+用于矩形板材开料优化与报价的 Windows x64 原生应用，使用 Rust + egui + SQLite。不需要 Node.js、Electron、WebView2 或本地 HTTP 服务。
 
 ## 运行与构建
 
-运行 `dist/rust-native/板优排.exe`。目标系统为 Windows 10/11 x64，需要正常的 OpenGL 显卡驱动。
+目标系统为 Windows 10/11 x64，需要正常的 OpenGL 显卡驱动。
 
 构建需要 Rust stable MSVC x64、Visual Studio C++ Build Tools 和 Windows SDK。在仓库根目录执行：
 
@@ -41,9 +41,8 @@ cargo run --target x86_64-pc-windows-msvc -- --demo
 
 ## 界面设计
 
-已应用确认后的工业浅色工作台 UI：深色侧栏、绿色主操作、浅色数据面板。五个主界面、工程库、打印预览、确认和关于窗口使用统一视觉规范。排版支持分组缩略图选择；设置拆分参数与模板页签；报价支持逐板调整与恢复自动计价。
+工业浅色工作台 UI：深色侧栏、绿色主操作、浅色数据面板。五个主界面、工程库、打印预览、确认和关于窗口使用统一视觉规范。排版支持分组缩略图选择；设置拆分参数与模板页签；报价支持逐板调整与恢复自动计价。
 
-原始静态设计稿保留在 `design/ui-proposal/`，仅作设计参考，不作为运行时依赖。应用使用真实工程数据，算法、计价公式和数据库结构保持不变。
 
 ## 数据与升级
 
